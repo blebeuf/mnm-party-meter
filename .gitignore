@@ -1,0 +1,43 @@
+# Python generated files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Test / coverage caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# Windows junk
+Thumbs.db
+Desktop.ini
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# MnM Party Meter local runtime data
+startup_error.log
