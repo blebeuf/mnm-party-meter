@@ -1,28 +1,52 @@
 # MnM Party Meter
 
-An external, OCR-based party damage meter for **Monsters & Memories**.
+External OCR-based party damage meter for **Monsters & Memories**.
 
-MnM Party Meter reads visible combat-log text from a user-selected area of the screen and turns outgoing damage into a simple live party meter. It was built primarily for beta testing, group play, and understanding how class damage changes across different stages of progression.
+MnM Party Meter reads visible combat-log text from a user-selected area of the screen and converts outgoing damage into a simple party meter. It does not read or modify game memory, inject code into the game, inspect network traffic, read game files for combat data, automate gameplay, or send commands to the game.
 
-## How It Works
+## How it works
 
-MnM Party Meter uses **OCR (Optical Character Recognition)** to read the combat text already visible on your screen.
+The meter uses OCR (Optical Character Recognition) to read the combat text already visible on your screen. Combat-log processing happens locally on your computer.
 
-The meter:
+For best results, use **two nearby MnM combat windows inside one OCR selection**:
 
-- Captures only the screen region you select.
-- Uses Tesseract OCR to recognize visible combat-log text.
-- Identifies outgoing damage events.
-- Attributes recognized damage to configured party members and pets.
-- Displays party damage totals in a lightweight overlay.
+- **Other (top):** outgoing damage from the rest of the party.
+- **My (bottom):** your outgoing damage and your pet's outgoing damage.
 
-All combat-log processing happens locally on your computer.
+### Combat window filters
 
-## Safety and Game Interaction
+**My window**
+- Melee > Hit: **Me + Mine + Pet**
+- Repeat **Me + Mine + Pet** under **Ability** and **Detrimental**.
 
-MnM Party Meter is an **external screen-reading utility**.
+**Other window**
+- Melee > Hit: **NPCs + Players**
+- Repeat **NPCs + Players** under **Ability** and **Detrimental**.
 
-It does **not**:
+Using the same source split across Melee, Ability, and Detrimental is important for spells, abilities, DoTs, procs, and pet-related damage.
+
+## v1.0.7
+
+- Preserves the occurrence-aware duplicate protection validated in live testing.
+- Legitimate identical hits can both count.
+- Old visible damage does not become new damage just because the chat scrolls or sits on screen.
+- Reset baselines visible text so old lines remain ignored.
+- Keeps **My** on the proven direct reader path.
+- Adds one conservative, bounded **Other-only** extra OCR sample when the Other pane is actively changing.
+- Quiet Other windows with one additional party member stay on the normal path; busier groups can receive the extra sample automatically.
+- 300 ms remains the recommended OCR refresh setting.
+
+## Window sizing
+
+Other and My can be approximately the same size. Keep several recent lines readable in both panes and keep the windows close together so one reasonably tight OCR rectangle can contain both. With especially heavy party traffic, a little extra vertical room for Other is optional rather than required.
+
+## Charm pets
+
+For Enchanter or Bard charm, MnM may show the charmed creature's name rather than its owner. For cleaner attribution, charm a creature you are not also actively fighting and enter that creature's exact name in the owner's **Pet name(s)** field.
+
+## Safety and game interaction
+
+MnM Party Meter is an external screen-reading utility. It does **not**:
 
 - Read or modify Monsters & Memories process memory.
 - Inject code into the game.
@@ -30,127 +54,21 @@ It does **not**:
 - Read game files to obtain combat information.
 - Send commands to the game.
 - Automate gameplay or player input.
-- Require your Monsters & Memories account credentials.
-- Upload your combat data to a remote service.
+- Require Monsters & Memories account credentials.
+- Upload combat data to a remote service.
 
 The program only analyzes pixels from the screen area that you explicitly designate for OCR.
 
-The Python source used by the meter is included in this repository so that users can inspect how it works.
+## Setup guide
 
-## Why Two Combat Windows?
+See [`docs/MnM_Party_Meter_Setup_Guide_1.0.7.pdf`](docs/MnM_Party_Meter_Setup_Guide_1.0.7.pdf).
 
-For the best results, MnM Party Meter uses two nearby combat-log windows in Monsters & Memories:
+## Accuracy note
 
-**Other** — outgoing damage from the other members of your party.
+OCR is inherently imperfect and cannot reconstruct a line that was never captured. The meter biases toward conservative counting and duplicate prevention rather than inflating damage with ambiguous stale reads.
 
-**My** — your outgoing damage and your pet's outgoing damage.
+## Acknowledgments
 
-You then select **one OCR capture region around both windows**.
+Thanks to the developers and contributors behind Python, Tesseract OCR, PySide6 / Qt for Python, Pillow, MSS, pytesseract, and PyInstaller, and to the Monsters & Memories community members who tested the meter.
 
-This split is intentional. A single combat window containing an entire party's damage can scroll extremely quickly. Separating your damage from the rest of the party reduces the amount of text moving through each window and gives OCR more opportunity to read combat events before they leave the screen.
-
-The two windows do not need to scroll at the same speed. In a full party, Other will normally move considerably faster than My.
-
-Different scroll speeds do not inherently create duplicate damage events.
-
-## OCR Refresh Rate
-
-The recommended starting refresh rate is **300 ms**.
-
-Faster scanning can help when the Other window is moving particularly quickly, but it also requires more processing power. Slower scanning reduces processing load but increases the possibility that rapidly scrolling combat text will leave the screen before OCR reads it.
-
-Because this is screen-based OCR, no OCR damage meter can guarantee perfect recognition under every combat, display, or UI condition.
-
-## Duplicate Protection
-
-The meter maintains information about recently recognized combat events so that a line remaining visible across multiple OCR captures is not intended to be counted repeatedly.
-
-When an encounter is reset, the meter also establishes a new baseline from the combat text already visible on screen. Existing lines are treated as pre-reset text so that the next encounter begins with newly appearing combat events rather than rereading the previous fight.
-
-## Pets
-
-Named pets can be assigned to their owner in the meter's setup screen.
-
-Enter the pet's combat-log name in the **Pet name(s)** field for that player. Multiple pet names can be entered when necessary.
-
-### Enchanter and Bard Charm
-
-Charmed creatures can be more difficult to attribute because another player's charm may appear in the combat log under the creature's own name rather than as "your pet" or "party member's pet."
-
-For the most reliable tracking:
-
-1. Charm a creature that your party is **not also actively fighting**.
-2. Enter that creature's name in the player's **Pet name(s)** field.
-3. Avoid using a commonly fought creature as the mapped charm target.
-
-If the party is fighting several creatures with the same name as the charmed pet, screen text alone may not contain enough information to reliably distinguish the charmed creature from hostile creatures.
-
-## What This Tool Is For
-
-The goal is not to call individual players out for low damage.
-
-MnM Party Meter is intended to help players understand questions such as:
-
-- How do classes perform on a fresh server with very little gear?
-- How does damage change as characters gain levels, spells, weapons, and equipment?
-- How much damage is contributed by pets, dots, procs, and other abilities?
-- How does party damage change between early, mid, and later progression?
-- How do different group compositions affect damage output?
-
-A single damage result should not be treated as a definitive class ranking. Level, equipment, encounter length, target selection, group composition, player role, downtime, and many other factors can substantially affect damage.
-
-## Installation
-
-Windows users should download the current packaged version from the repository's **Releases** section rather than downloading the source repository ZIP.
-
-The Windows package includes an installer that prepares the required application environment and checks for Tesseract OCR.
-
-If a compatible Tesseract installation already exists, the installer can reuse it.
-
-### Updating
-
-To install a newer version:
-
-1. Close MnM Party Meter.
-2. Extract the new release ZIP.
-3. Run `INSTALL - START HERE.cmd`.
-4. Continue using the MnM Party Meter desktop shortcut.
-
-You should not need to uninstall Python, Tesseract, or the previous meter version before updating.
-
-## Setup Guide
-
-The complete illustrated setup and beta-testing guide is available in the `docs` folder and with the Windows release.
-
-It covers installation, combat-window configuration, OCR selection, party and pet setup, refresh rates, accuracy considerations, charm pets, and interpreting results.
-
-## Source
-
-The primary application source is available in:
-
-`src/main.py`
-
-Python dependencies are listed in:
-
-`src/requirements.txt`
-
-## Third-Party Software
-
-MnM Party Meter is built with open-source software, including:
-
-- Python
-- Tesseract OCR
-- PySide6 / Qt
-- pytesseract
-- Pillow
-- MSS
-
-Licenses, acknowledgments, and project links are provided in `THIRD_PARTY_NOTICES.md`.
-
-Thank you to the developers and contributors who maintain these projects and make tools like this possible.
-
-## Status
-
-MnM Party Meter is an independent community utility created for use with Monsters & Memories.
-
-It is not affiliated with, endorsed by, or an official product of the Monsters & Memories development team.
+MnM Party Meter is an independent community utility and is not affiliated with, endorsed by, or an official product of Monsters & Memories or Niche Worlds Cult.

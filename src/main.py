@@ -7,6 +7,7 @@ import random
 import re
 import sys
 import time
+import threading
 import traceback
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -37,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "MNMPartyMeter"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.7"
 MAX_PARTY = 6
 
 CLASS_CHOICES = [
@@ -396,6 +397,186 @@ def line_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, normalize_line(a).lower(), normalize_line(b).lower()).ratio()
 
 
+TRACKER_STATIC_LINES = {
+    "my", "other", "main", "mud", "combat", "damage", "chat", "chat2"
+}
+
+
+def tracker_anchor_text(line: str) -> str:
+    """Normalize a line for ordered frame-overlap matching."""
+    text = normalize_line(line).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_tracker_anchor_line(line: str) -> bool:
+    text = tracker_anchor_text(line)
+    return len(text) >= 4 and text not in TRACKER_STATIC_LINES
+
+
+class OCRLineTracker:
+    """Tail a scrolling OCR chat pane without confusing movement for new text.
+
+    MnM appends new chat at the bottom. Instead of keeping long-lived individual
+    "ghost" lines, this tracker keeps a short history of complete OCR frames and
+    finds the ordered overlap between an older frame and the current frame.
+
+    This solves both sides of the duplicate problem:
+      * old damage that moves upward or briefly disappears from OCR is not emitted
+        again when it becomes readable later; and
+      * a genuinely new identical hit is still emitted because it extends the
+        known log tail beyond the matched overlap.
+
+    The ordered matcher deliberately prefers the earliest current occurrence when
+    identical text appears more than once. For example, if one 22-damage hit was
+    already known and the current frame contains two identical 22-damage lines,
+    the older/top occurrence is matched and the newer/bottom occurrence is new.
+    """
+
+    def __init__(self, max_frames: int = 16, threshold: float = 0.74) -> None:
+        self.max_frames = max(4, int(max_frames))
+        self.threshold = float(threshold)
+        self.frames: list[list[str]] = []
+
+    def reset(self, lines: list[str] | None = None) -> None:
+        self.frames = []
+        current = [normalize_line(x) for x in (lines or []) if normalize_line(x)]
+        if current:
+            self.frames.append(current)
+
+    def _ordered_matches(
+        self, previous: list[str], current: list[str]
+    ) -> list[tuple[int, int, float]]:
+        """Return a best monotonic fuzzy alignment of previous -> current.
+
+        Score priority is: number of matches, total text similarity, then earlier
+        current positions. That last tie-break is what preserves repeated
+        identical hits: an existing occurrence matches the older/top copy first.
+        """
+        m, n = len(previous), len(current)
+        if not m or not n:
+            return []
+
+        # (match_count, similarity_sum, negative_sum_current_indices,
+        #  sum_previous_indices). Python tuple ordering gives deterministic ties.
+        scores: list[list[tuple[int, float, int, int] | None]] = [
+            [None] * (n + 1) for _ in range(m + 1)
+        ]
+        parents: list[list[tuple | None]] = [
+            [None] * (n + 1) for _ in range(m + 1)
+        ]
+        scores[0][0] = (0, 0.0, 0, 0)
+
+        def consider(ni: int, nj: int, score: tuple, parent: tuple) -> None:
+            old = scores[ni][nj]
+            if old is None or score > old:
+                scores[ni][nj] = score
+                parents[ni][nj] = parent
+
+        for i in range(m + 1):
+            for j in range(n + 1):
+                base = scores[i][j]
+                if base is None:
+                    continue
+                if i < m:
+                    consider(i + 1, j, base, ("skip_previous", i, j))
+                if j < n:
+                    consider(i, j + 1, base, ("skip_current", i, j))
+                if i < m and j < n:
+                    if not (is_tracker_anchor_line(previous[i]) and is_tracker_anchor_line(current[j])):
+                        continue
+                    similarity = line_similarity(previous[i], current[j])
+                    if similarity < self.threshold:
+                        continue
+                    matched = (
+                        base[0] + 1,
+                        base[1] + similarity,
+                        base[2] - j,
+                        base[3] + i,
+                    )
+                    consider(
+                        i + 1,
+                        j + 1,
+                        matched,
+                        ("match", i, j, similarity),
+                    )
+
+        pairs: list[tuple[int, int, float]] = []
+        i, j = m, n
+        while i > 0 or j > 0:
+            parent = parents[i][j]
+            if parent is None:
+                break
+            kind = parent[0]
+            if kind == "match":
+                _kind, pi, cj, similarity = parent
+                pairs.append((pi, cj, similarity))
+                i, j = pi, cj
+            else:
+                _kind, pi, cj = parent
+                i, j = pi, cj
+        pairs.reverse()
+        return pairs
+
+    def update(self, lines: list[str]) -> list[str]:
+        current = [normalize_line(x) for x in lines if normalize_line(x)]
+        if not current:
+            # A blank/failed OCR scan should not erase our memory of the log.
+            return []
+
+        if not self.frames:
+            self.frames.append(current)
+            return current
+
+        meaningful_current = sum(1 for line in current if is_tracker_anchor_line(line))
+        best: tuple[int, int, float, int, list[tuple[int, int, float]]] | None = None
+
+        # Compare against several recent complete frames. This survives a short
+        # Tesseract dropout without creating phantom line occurrences.
+        for age, previous in enumerate(reversed(self.frames)):
+            pairs = self._ordered_matches(previous, current)
+            if not pairs:
+                continue
+            count = len(pairs)
+            average = sum(p[2] for p in pairs) / count
+
+            # One strong anchor is enough against the immediately previous frame.
+            # Older frames require two anchors, unless only one meaningful line is
+            # visible. This prevents a very old identical damage value from
+            # suppressing a genuinely new repeat much later in combat.
+            reliable = (
+                count >= 2
+                or (age == 0 and count == 1 and average >= 0.86)
+                or (
+                    meaningful_current <= 1
+                    and age <= 2
+                    and count == 1
+                    and average >= 0.94
+                )
+            )
+            if not reliable:
+                continue
+
+            overlap_end = max(cj for _pi, cj, _score in pairs)
+            # Prefer the frame with the strongest contextual overlap first.
+            # This prevents one old repeated damage line from outranking a much
+            # better match to the immediately preceding frame merely because the
+            # repeated text happens to sit at the current bottom edge.
+            candidate = (count, overlap_end, average, -age, pairs)
+            if best is None or candidate[:4] > best[:4]:
+                best = candidate
+
+        if best is None:
+            fresh = current
+        else:
+            overlap_end = best[1]
+            fresh = current[overlap_end + 1 :]
+
+        self.frames.append(current)
+        if len(self.frames) > self.max_frames:
+            self.frames = self.frames[-self.max_frames :]
+        return fresh
+
 def new_lines_from_frames(previous: list[str], current: list[str]) -> list[str]:
     """Return lines that are genuinely new, even when chat scrolls quickly.
 
@@ -431,9 +612,21 @@ def new_lines_from_frames(previous: list[str], current: list[str]) -> list[str]:
 
 
 class OCRWorker(QThread):
-    # Emit independent OCR frames for the upper (Other) and lower (My) chat panes.
-    # Keeping them separate is important: merging several OCR passes caused the
-    # frame-diff code to lose live lines, especially You/Your Pet messages.
+    """v1.0.5 reader with a conservative Other-only burst sampler.
+
+    The normal combined scan path is intentionally the same as v1.0.5: every
+    user refresh interval, Other and My are captured together and OCR'd
+    concurrently. That preserves the responsive My behavior that already passed
+    live testing.
+
+    The only performance addition is an optional *extra* upper/Other scan between
+    normal scans when the upper pane is actively changing. The burst scan never
+    queues multiple frames, never delays the normal My scan, and uses the same
+    OCR preprocessing/parser path. All emitted upper frames still pass through
+    the unchanged v1.0.5 occurrence tracker, so stale visible lines are not
+    re-counted while genuine repeated identical hits can still count separately.
+    """
+
     text_frame = Signal(object)
     error = Signal(str)
 
@@ -442,9 +635,22 @@ class OCRWorker(QThread):
         self.region = dict(region)
         self.interval_ms = interval_ms
         self._running = True
+        self._burst_generation = 0
+        self._burst_lock = threading.Lock()
 
     def stop(self) -> None:
         self._running = False
+        with self._burst_lock:
+            self._burst_generation += 1
+
+    def invalidate_bursts(self) -> None:
+        """Invalidate any Other-only burst scheduled before a reset."""
+        with self._burst_lock:
+            self._burst_generation += 1
+
+    def _current_burst_generation(self) -> int:
+        with self._burst_lock:
+            return self._burst_generation
 
     def run(self) -> None:
         try:
@@ -463,9 +669,6 @@ class OCRWorker(QThread):
             if env_tess:
                 candidates.append(Path(env_tess))
 
-            # The streamlined installer records the exact Tesseract executable
-            # it selected, whether that is an existing system install or the
-            # copy installed with MnM Party Meter.
             local_root = Path(os.getenv("LOCALAPPDATA", Path.home())) / APP_NAME
             tess_path_file = local_root / "state" / "tesseract_path.txt"
             try:
@@ -476,7 +679,6 @@ class OCRWorker(QThread):
             except Exception:
                 pass
 
-            # True standalone builds place Tesseract beside the application.
             if getattr(sys, "frozen", False):
                 exe_dir = Path(sys.executable).resolve().parent
                 candidates.extend([
@@ -509,10 +711,6 @@ class OCRWorker(QThread):
                     continue
 
         def prep_text(img):
-            # MnM mixes white/light-gray player text with orange pet text over a
-            # translucent game background. Max-channel luminance preserves the
-            # orange text, while a blurred-background difference lifts faint gray
-            # strokes that would otherwise disappear against bright scenery.
             r, g, b = img.split()
             bright = ImageChops.lighter(ImageChops.lighter(r, g), b)
             bright = ImageOps.autocontrast(bright, cutoff=1)
@@ -520,8 +718,6 @@ class OCRWorker(QThread):
             bg = bright.filter(ImageFilter.GaussianBlur(radius=3.0))
             detail = ImageChops.difference(bright, bg)
             detail = ImageOps.autocontrast(detail, cutoff=1)
-            # Screen blend equivalent: keep strong colored/white luminance and
-            # add local text edges. This avoids a brittle hard threshold.
             proc = ImageChops.lighter(bright, detail)
             proc = ImageOps.autocontrast(proc, cutoff=1)
             proc = ImageOps.invert(proc)
@@ -537,47 +733,125 @@ class OCRWorker(QThread):
             )
             return [normalize_line(x) for x in txt.splitlines() if normalize_line(x)]
 
-        with mss.mss() as sct, ThreadPoolExecutor(max_workers=2) as pool:
-            while self._running:
-                started = time.time()
-                try:
-                    raw = sct.grab(self.region)
+        # The optional Other-only path has its own single worker. It can never
+        # take either of the two workers used by the proven v1.0.5 normal scan.
+        burst_pool = ThreadPoolExecutor(max_workers=1)
+        burst_future = None
+        previous_upper_lines: list[str] = []
+
+        def run_upper_burst(delay_ms: int, generation: int):
+            slept = 0
+            while self._running and slept < delay_ms:
+                step = min(20, delay_ms - slept)
+                time.sleep(step / 1000.0)
+                slept += step
+            if not self._running or generation != self._current_burst_generation():
+                return None
+
+            try:
+                with mss.mss() as burst_sct:
+                    raw = burst_sct.grab(self.region)
+                    captured_at = time.time()
                     image = Image.frombytes("RGB", raw.size, raw.rgb)
                     w, h = image.size
-
-                    # The user's selected box spans Other above My. Read each
-                    # pane as its own stable text block instead of mixing OCR
-                    # outputs into one unstable frame.
                     split = int(h * 0.50)
                     upper = image.crop((0, 0, w, min(h, split + 16)))
-                    lower = image.crop((0, max(0, split - 16), w, h))
-
-                    # OCR the two panes concurrently. Tesseract runs as separate
-                    # subprocesses, so this cuts wall-clock scan latency on
-                    # multi-core systems and gives fast-scrolling lines a better
-                    # chance of being sampled before they disappear.
-                    upper_future = pool.submit(ocr_lines, upper)
-                    lower_future = pool.submit(ocr_lines, lower)
-                    upper_lines = upper_future.result()
-                    lower_lines = lower_future.result()
+                    started = time.time()
+                    upper_lines = ocr_lines(upper)
                     scan_ms = int((time.time() - started) * 1000)
-                    self.text_frame.emit({
-                        "upper": upper_lines,
-                        "lower": lower_lines,
-                        "scan_ms": scan_ms,
-                    })
-                except Exception as exc:
-                    self.error.emit(str(exc))
-                    return
-                elapsed_ms = int((time.time() - started) * 1000)
-                # Other (upper) is normally the high-traffic pane. If it is
-                # already carrying a dense block of text, temporarily shorten
-                # the next sampling interval by 20%. The user's configured
-                # refresh remains the normal cadence; this is only a burst
-                # response to a busy pane.
-                busy_upper = len(upper_lines) >= 7
-                target_ms = max(180, int(self.interval_ms * 0.80)) if busy_upper else self.interval_ms
-                self.msleep(max(30, target_ms - elapsed_ms))
+            except Exception:
+                return None
+
+            if not self._running or generation != self._current_burst_generation():
+                return None
+
+            return {
+                "upper": upper_lines,
+                "scan_ms": scan_ms,
+                "partial": True,
+                "source": "upper",
+                "captured_at": captured_at,
+                "other_burst": True,
+            }
+
+        def emit_burst_result(future):
+            try:
+                payload = future.result()
+                if payload and self._running:
+                    self.text_frame.emit(payload)
+            except Exception:
+                # A failed optional burst must never stop the normal reader.
+                pass
+
+        try:
+            with mss.mss() as sct, ThreadPoolExecutor(max_workers=2) as pool:
+                while self._running:
+                    started = time.time()
+                    try:
+                        captured_at = time.time()
+                        raw = sct.grab(self.region)
+                        image = Image.frombytes("RGB", raw.size, raw.rgb)
+                        w, h = image.size
+
+                        # Exact v1.0.5 normal capture split.
+                        split = int(h * 0.50)
+                        upper = image.crop((0, 0, w, min(h, split + 16)))
+                        lower = image.crop((0, max(0, split - 16), w, h))
+
+                        # Exact v1.0.5 normal OCR path. My is never buffered,
+                        # cached, or placed behind an asynchronous queue.
+                        upper_future = pool.submit(ocr_lines, upper)
+                        lower_future = pool.submit(ocr_lines, lower)
+                        upper_lines = upper_future.result()
+                        lower_lines = lower_future.result()
+                        scan_ms = int((time.time() - started) * 1000)
+                        self.text_frame.emit({
+                            "upper": upper_lines,
+                            "lower": lower_lines,
+                            "scan_ms": scan_ms,
+                            "partial": False,
+                            "captured_at": captured_at,
+                            "other_burst": False,
+                        })
+                    except Exception as exc:
+                        self.error.emit(str(exc))
+                        return
+
+                    normalized_upper = [normalize_line(x) for x in upper_lines if normalize_line(x)]
+                    upper_changed = normalized_upper != previous_upper_lines
+                    previous_upper_lines = normalized_upper
+
+                    if burst_future is not None and burst_future.done():
+                        burst_future = None
+
+                    # Trigger on actual upper-pane activity, never configured
+                    # party size. One other player can remain quiet; five players
+                    # can automatically receive the extra midpoint sample.
+                    enough_visible_history = len(normalized_upper) >= 4
+                    if (
+                        self._running
+                        and upper_changed
+                        and enough_visible_history
+                        and burst_future is None
+                    ):
+                        if len(normalized_upper) >= 8:
+                            delay_ms = max(90, min(130, int(self.interval_ms * 0.35)))
+                        else:
+                            delay_ms = max(110, min(170, int(self.interval_ms * 0.50)))
+                        generation = self._current_burst_generation()
+                        burst_future = burst_pool.submit(run_upper_burst, delay_ms, generation)
+                        burst_future.add_done_callback(emit_burst_result)
+
+                    elapsed_ms = int((time.time() - started) * 1000)
+                    # Preserve v1.0.5's existing busy-Other cadence.
+                    busy_upper = len(upper_lines) >= 7
+                    target_ms = max(180, int(self.interval_ms * 0.80)) if busy_upper else self.interval_ms
+                    self.msleep(max(30, target_ms - elapsed_ms))
+        finally:
+            self._running = False
+            with self._burst_lock:
+                self._burst_generation += 1
+            burst_pool.shutdown(wait=False, cancel_futures=True)
 
 
 class RegionSelector(QWidget):
@@ -1108,7 +1382,12 @@ class SettingsWindow(QMainWindow):
         self.encounter = Encounter([p for p in self.cfg["party"] if p])
         self.previous_ocr_frames: dict[str, list[str]] = {"upper": [], "lower": []}
         self.last_raw_ocr_frames: dict[str, list[str]] = {"upper": [], "lower": []}
+        self.ocr_line_trackers: dict[str, OCRLineTracker] = {
+            "upper": OCRLineTracker(),
+            "lower": OCRLineTracker(),
+        }
         self.ocr_baseline_pending = True
+        self.last_upper_capture_time = 0.0
         self.recent_damage_events: list[tuple[float, str, int, str, str]] = []
         self.worker: OCRWorker | None = None
         self.demo_timer = QTimer(self)
@@ -1126,8 +1405,8 @@ class SettingsWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         intro = QLabel(
-            "v1.0.2: Keep TWO MnM combat windows (Other above My) inside ONE OCR selection. "
-            "The meter reads the panes independently and can sample faster when Other becomes busy. "
+            "Keep TWO MnM combat windows (Other above My) inside ONE OCR selection. "
+            "Set My to Me/Mine/Pet and Other to NPCs/Players across Melee Hit, Ability, and Detrimental filters. "
             "For charm pets, choose a creature you are not also fighting and enter that creature name in Pet name(s)."
         )
         intro.setWordWrap(True)
@@ -1367,7 +1646,10 @@ class SettingsWindow(QMainWindow):
             return
         self.previous_ocr_frames = {"upper": [], "lower": []}
         self.last_raw_ocr_frames = {"upper": [], "lower": []}
+        for tracker in self.ocr_line_trackers.values():
+            tracker.reset()
         self.ocr_baseline_pending = True
+        self.last_upper_capture_time = 0.0
         self.last_scan_ms = 0
         self.recent_damage_events = []
         self.worker = OCRWorker(self.cfg["combat_ocr_region"], self.interval.value())
@@ -1419,31 +1701,47 @@ class SettingsWindow(QMainWindow):
             frames = {"upper": list(frames or []), "lower": []}
 
         self.last_scan_ms = int(frames.get("scan_ms", 0) or 0)
+        captured_at = float(frames.get("captured_at", time.time()) or time.time())
         self_name = normalize_line(self.self_edit.text()) or "You"
         party = self.current_party()
         pet_owner_map = self.current_pet_owner_map()
         parsed = []
         saw_fresh = []
 
-        # After Start/Reset, the first complete OCR frame is a baseline only.
-        # Everything already visible in both MnM combat panes is considered
-        # pre-encounter text and must not be counted as new damage.
+        # Only a normal complete Other+My frame may establish Start/Reset
+        # baseline. Optional Other-only burst frames are ignored until then.
+        is_partial = bool(frames.get("partial", False))
         if self.ocr_baseline_pending:
+            if is_partial:
+                return
             for source in ("upper", "lower"):
                 raw_lines = list(frames.get(source, []) or [])
                 self.last_raw_ocr_frames[source] = raw_lines
-                self.previous_ocr_frames[source] = stitch_wrapped_damage_lines(raw_lines)
+                logical_lines = stitch_wrapped_damage_lines(raw_lines)
+                self.previous_ocr_frames[source] = logical_lines
+                self.ocr_line_trackers[source].reset(logical_lines)
+            self.last_upper_capture_time = captured_at
             self.ocr_baseline_pending = False
             self.log_label.setText("READY — existing combat text ignored; waiting for new damage.")
             return
 
-        for source in ("upper", "lower"):
+        # Normal frames update both panes. Extra adaptive frames update Other
+        # only; the My tracker is left completely untouched.
+        sources = ("upper",) if is_partial else ("upper", "lower")
+        for source in sources:
+            # An optional Other-only OCR can finish after a later normal scan.
+            # Never feed an older upper frame backward through the v1.0.5
+            # occurrence tracker. Stale bursts are simply discarded.
+            if source == "upper" and captured_at <= self.last_upper_capture_time:
+                continue
+
             raw_lines = list(frames.get(source, []) or [])
             self.last_raw_ocr_frames[source] = raw_lines
             logical_lines = stitch_wrapped_damage_lines(raw_lines)
-            previous = self.previous_ocr_frames.get(source, [])
-            fresh = new_lines_from_frames(previous, logical_lines)
+            fresh = self.ocr_line_trackers[source].update(logical_lines)
             self.previous_ocr_frames[source] = logical_lines
+            if source == "upper":
+                self.last_upper_capture_time = captured_at
             saw_fresh.extend(fresh)
 
             for line in fresh:
@@ -1451,7 +1749,10 @@ class SettingsWindow(QMainWindow):
                 if not event:
                     continue
                 player, amount = event
-                now = time.time()
+                # Use screen-capture time rather than OCR-completion time. This
+                # keeps cross-pane duplicate protection accurate even when an
+                # optional Other scan takes longer to OCR.
+                now = captured_at
                 if self.is_duplicate_damage(player, amount, line, now, source):
                     continue
                 self.encounter.add_damage(
@@ -1537,9 +1838,13 @@ class SettingsWindow(QMainWindow):
     def reset_encounter(self) -> None:
         self.encounter.reset(self.current_party())
         self.previous_ocr_frames = {"upper": [], "lower": []}
+        for tracker in self.ocr_line_trackers.values():
+            tracker.reset()
         self.recent_damage_events = []
         self.ocr_baseline_pending = True
+        self.last_upper_capture_time = 0.0
         if self.worker is not None:
+            self.worker.invalidate_bursts()
             self.log_label.setText("Encounter reset — baselining visible combat text…")
         else:
             self.log_label.setText("Encounter reset — existing text will be ignored when OCR starts.")
